@@ -461,9 +461,11 @@ def build_default_config() -> Config:
     scenarios = (
         KeyRateScenario(prob=0.14, new_key_rate=0.15),
         KeyRateScenario(prob=0.80, new_key_rate=0.13),
-        KeyRateScenario(prob=0.01, new_key_rate=0.17),
-        KeyRateScenario(prob=0.05, new_key_rate=0.165),
+        #KeyRateScenario(prob=0.01, new_key_rate=0.17),
+        #KeyRateScenario(prob=0.05, new_key_rate=0.165),
     )
+    #нормализируем вероятности
+    scenarios = [KeyRateScenario(prob=x.prob/sum(y.prob for y in scenarios),new_key_rate=x.new_key_rate) for x in scenarios]
 
     bank_sens = {
         "Tinkoff": 1.0,
