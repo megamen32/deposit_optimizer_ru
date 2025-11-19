@@ -75,7 +75,6 @@ def per_scenario_rate(
 
 
 # ---------- Помесячная симуляция для Газпрома ----------
-
 def gazprom_term_growth_monthly(
     duration_years: float,
     base_rate: float,
@@ -84,31 +83,25 @@ def gazprom_term_growth_monthly(
 ) -> float:
     """
     Ростовый множитель для ОДНОГО срока вклада Газпрома
-    при помесячной капитализации и плавном изменении ключевой.
+    при помесячной капитализации, если считаем, что в данном
+    сценарии ключевая уже стала scen.new_key_rate и такой
+    остаётся весь срок вклада.
 
     Модель:
-      - на момент открытия ключевая = cfg.key_rate_base;
-      - к концу срока ключевая линеарно приходит к scen.new_key_rate;
-      - ставка вклада в каждом месяце = key_rate_month + margin,
-        где margin = base_rate - key_rate_base;
-      - капитализация каждый месяц.
+      - номинальная ставка вклада в этом сценарии:
+            r_nom = scen.new_key_rate + margin,
+        где margin = base_rate - cfg.key_rate_base (фиксированный спред);
+      - капитализация каждый месяц:
+            factor = Π (1 + r_nom/12).
     """
     total_months = max(1, int(round(duration_years * 12.0)))
     margin = base_rate - cfg.key_rate_base
+    r_nom = scen.new_key_rate + margin        # годовая ставка в этом сценарии
+    monthly_rate = r_nom / 12.0
 
-    factor = 1.0
-    for m in range(total_months):
-        # t в [0,1] по ходу срока
-        t = (m + 0.5) / total_months
-        key_rate_m = cfg.key_rate_base + (scen.new_key_rate - cfg.key_rate_base) * t
-        r_m = key_rate_m + margin          # годовая ставка в этом месяце
-        monthly_rate = r_m / 12.0
-        factor *= (1.0 + monthly_rate)
-
+    factor = (1.0 + monthly_rate) ** total_months
     return factor
 
-
-# ---------- Рост стратегии ----------
 
 def strategy_growth_factor(
     strategy: Strategy,
@@ -130,28 +123,36 @@ def strategy_growth_factor(
 
     for term_id in strategy.term_ids:
         if term_id not in bank.terms:
-            raise ValueError(f"Unknown term_id {term_id} in bank {bank.name} for strategy {strategy.name}")
+            raise ValueError(
+                f"Unknown term_id {term_id} in bank {bank.name} for strategy {strategy.name}"
+            )
 
     total_years = sum(bank.terms[tid][0] for tid in strategy.term_ids)
     if total_years <= 0:
         return 1.0, 0.0
 
     growth_factor_exp = 0.0
+
     for scen in cfg.key_rate_scenarios:
         factor_s = 1.0
+
         for j, term_id in enumerate(strategy.term_ids):
             duration_years, base_rate = bank.terms[term_id]
 
             if strategy.bank_name == "Gazprom":
-                # Газпром: плавающий, считаем по месяцам с траекторией ключевой
+                # Газпром: ставка = (ключевая в сценарии + спред),
+                # считаем, что ключевая уже scen.new_key_rate весь срок.
                 growth_term = gazprom_term_growth_monthly(duration_years, base_rate, cfg, scen)
+
             else:
-                # Остальные банки: первый вклад — фикс. по текущей сетке,
-                # последующие — ретарифированные под сценарную ключевую
+                # Остальные банки:
+                #   - первый вклад: фиксированная текущая ставка (base_rate),
+                #   - последующие: ретарифируем под сценарий через per_scenario_rate().
                 if j == 0:
                     r_s = base_rate
                 else:
                     r_s = per_scenario_rate(base_rate, strategy.bank_name, term_id, scen, cfg)
+
                 months = duration_years * 12.0
                 monthly_rate = r_s / 12.0
                 growth_term = (1.0 + monthly_rate) ** months
@@ -161,6 +162,7 @@ def strategy_growth_factor(
         growth_factor_exp += scen.prob * factor_s
 
     return growth_factor_exp, total_years
+
 
 
 
