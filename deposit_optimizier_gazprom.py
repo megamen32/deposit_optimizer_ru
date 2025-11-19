@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 
 # ---------- Data structures ----------
@@ -59,21 +59,70 @@ def per_scenario_rate(
     scenario: KeyRateScenario,
     cfg: Config,
 ) -> float:
-    # Спец-логика для Газпрома: rate = key_rate + фиксированный спред.
+    """
+    Сценарная ставка банка.
+
+    Газпром здесь НЕ используем (он обрабатывается отдельно),
+    Остальные банки: ретарифируются мультипликативно.
+    """
     if bank_name == "Gazprom":
-        margin = base_rate - cfg.key_rate_base
-        return scenario.new_key_rate + margin
+        # для Газпрома реальную ставку считаем помесячно отдельно
+        raise RuntimeError("per_scenario_rate should not be used for Gazprom")
 
     sens = cfg.bank_sensitivity.get(bank_name, 1.0)
     factor = (scenario.new_key_rate / cfg.key_rate_base) ** sens
     return base_rate * factor
 
 
+# ---------- Помесячная симуляция для Газпрома ----------
+
+def gazprom_term_growth_monthly(
+    duration_years: float,
+    base_rate: float,
+    cfg: Config,
+    scen: KeyRateScenario,
+) -> float:
+    """
+    Ростовый множитель для ОДНОГО срока вклада Газпрома
+    при помесячной капитализации и плавном изменении ключевой.
+
+    Модель:
+      - на момент открытия ключевая = cfg.key_rate_base;
+      - к концу срока ключевая линеарно приходит к scen.new_key_rate;
+      - ставка вклада в каждом месяце = key_rate_month + margin,
+        где margin = base_rate - key_rate_base;
+      - капитализация каждый месяц.
+    """
+    total_months = max(1, int(round(duration_years * 12.0)))
+    margin = base_rate - cfg.key_rate_base
+
+    factor = 1.0
+    for m in range(total_months):
+        # t в [0,1] по ходу срока
+        t = (m + 0.5) / total_months
+        key_rate_m = cfg.key_rate_base + (scen.new_key_rate - cfg.key_rate_base) * t
+        r_m = key_rate_m + margin          # годовая ставка в этом месяце
+        monthly_rate = r_m / 12.0
+        factor *= (1.0 + monthly_rate)
+
+    return factor
+
+
+# ---------- Рост стратегии ----------
+
 def strategy_growth_factor(
     strategy: Strategy,
     banks: Dict[str, Bank],
     cfg: Config,
 ) -> Tuple[float, float]:
+    """
+    Ожидаемый рост капитала по стратегии с учётом сценариев ключевой
+    и ежемесячной капитализации.
+
+    Возвращает:
+      growth_factor_exp — E[factor_s] по сценариям;
+      total_years       — суммарная длительность стратегии (в годах).
+    """
     if strategy.bank_name not in banks:
         raise ValueError(f"Unknown bank in strategy {strategy.name}: {strategy.bank_name}")
 
@@ -90,16 +139,29 @@ def strategy_growth_factor(
     growth_factor_exp = 0.0
     for scen in cfg.key_rate_scenarios:
         factor_s = 1.0
-        for term_id in strategy.term_ids:
+        for j, term_id in enumerate(strategy.term_ids):
             duration_years, base_rate = bank.terms[term_id]
-            months = duration_years * 12.0
-            r_s = per_scenario_rate(base_rate, strategy.bank_name, term_id, scen, cfg)
-            monthly_rate = r_s / 12.0
-            growth_term = (1.0 + monthly_rate) ** months
+
+            if strategy.bank_name == "Gazprom":
+                # Газпром: плавающий, считаем по месяцам с траекторией ключевой
+                growth_term = gazprom_term_growth_monthly(duration_years, base_rate, cfg, scen)
+            else:
+                # Остальные банки: первый вклад — фикс. по текущей сетке,
+                # последующие — ретарифированные под сценарную ключевую
+                if j == 0:
+                    r_s = base_rate
+                else:
+                    r_s = per_scenario_rate(base_rate, strategy.bank_name, term_id, scen, cfg)
+                months = duration_years * 12.0
+                monthly_rate = r_s / 12.0
+                growth_term = (1.0 + monthly_rate) ** months
+
             factor_s *= growth_term
+
         growth_factor_exp += scen.prob * factor_s
 
     return growth_factor_exp, total_years
+
 
 
 def effective_annual_rate(strategy: Strategy, banks: Dict[str, Bank], cfg: Config) -> float:
@@ -116,16 +178,23 @@ def net_interest_for_amount_and_strategy(
     banks: Dict[str, Bank],
     cfg: Config,
     tax_free_limit: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float]:
+    """
+    Возвращает:
+      net        — чистые проценты после НДФЛ,
+      eff_rate   — эф. годовая ставка (ожидаемая),
+      taxable    — налоговая база (проценты сверх лимита),
+      tax        — НДФЛ.
+    """
     if amount <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     eff_rate = effective_annual_rate(strategy, banks, cfg)
     interest = amount * eff_rate
     taxable = max(0.0, interest - tax_free_limit)
     tax = taxable * cfg.tax_rate
     net = interest - tax
-    return net, eff_rate
+    return net, eff_rate, taxable, tax
 
 
 def best_strategy_for_person_amount(
@@ -135,24 +204,41 @@ def best_strategy_for_person_amount(
     cfg: Config,
     tax_free_limit: float,
 ):
+    """
+    Для фиксированной суммы подбирает стратегию с максимальным net.
+    Возвращает:
+      net, chosen_strategy, eff_rate, taxable, tax
+    """
     if amount <= 0:
-        return 0.0, None, 0.0
+        return 0.0, None, 0.0, 0.0, 0.0
 
     best_net = float("-inf")
     best_strat = None
     best_rate = 0.0
+    best_taxable = 0.0
+    best_tax = 0.0
 
     for strat in strategies:
-        net, eff_rate = net_interest_for_amount_and_strategy(amount, strat, banks, cfg, tax_free_limit)
+        net, eff_rate, taxable, tax = net_interest_for_amount_and_strategy(
+            amount, strat, banks, cfg, tax_free_limit
+        )
         if net > best_net:
             best_net = net
             best_strat = strat
             best_rate = eff_rate
+            best_taxable = taxable
+            best_tax = tax
 
-    return best_net, best_strat, best_rate
+    return best_net, best_strat, best_rate, best_taxable, best_tax
 
+
+# ---------- Генерация разбиения суммы между людьми ----------
 
 def generate_allocations(cfg: Config):
+    """
+    Возвращает все разбиения total_amount на people_count частей
+    с шагом cfg.step (в рублях).
+    """
     units_total = int(round(cfg.total_amount / cfg.step))
     n = cfg.people_count
 
@@ -172,10 +258,19 @@ def generate_allocations(cfg: Config):
     return allocations
 
 
+# ---------- Автогенерация стратегий ----------
+
 def auto_generate_strategies_for_bank(
     bank: Bank,
     cfg: Config,
 ) -> List[Strategy]:
+    """
+    Автогенерация стратегий для одного банка.
+
+    Комбинации сроков с повторениями, суммарная длительность которых
+    лежит в [min_years, max_years], с ограничением max_terms_per_strategy.
+    Порядок сроков неубывающий, чтобы не плодить перестановки.
+    """
     term_items = sorted(bank.terms.items(), key=lambda kv: kv[1][0])
     strategies: List[Strategy] = []
 
@@ -210,34 +305,72 @@ def auto_generate_all_strategies(banks: Dict[str, Bank], cfg: Config) -> List[St
     return all_strats
 
 
+# ---------- ТОП стратегий ----------
+
+def print_top_strategies(strategies: List[Strategy], banks: Dict[str, Bank], cfg: Config, top_n: int = 5) -> None:
+    print("=== ТОП стратегий по эффективной годовой ставке (ожидаемой) ===")
+
+    # считаем эффективную ставку для всех стратегий
+    stats = []
+    for strat in strategies:
+        r_eff = effective_annual_rate(strat, banks, cfg)
+        stats.append((strat, r_eff))
+
+    # общий топ
+    stats_sorted = sorted(stats, key=lambda x: x[1], reverse=True)
+    print(f"\n--- Общий ТОП-{top_n} ---")
+    for i, (s, r) in enumerate(stats_sorted[:top_n], start=1):
+        print(f"{i}. {s.bank_name:8s} | {s.name:30s} -> эф.ставка = {r*100:.3f}%")
+
+    # по каждому банку
+    print()
+    banks_set = sorted({s.bank_name for s, _ in stats_sorted})
+    for bank_name in banks_set:
+        bank_stats = [(s, r) for (s, r) in stats_sorted if s.bank_name == bank_name]
+        if not bank_stats:
+            continue
+        print(f"--- Банк {bank_name} — ТОП-{top_n} ---")
+        for i, (s, r) in enumerate(bank_stats[:top_n], start=1):
+            print(f"{i}. {s.name:30s} -> эф.ставка = {r*100:.3f}%")
+        print()
+
+
+# ---------- Глобальный поиск лучшей конфигурации ----------
+
 def search_best_config(cfg: Config, banks: Dict[str, Bank], strategies: List[Strategy]) -> None:
     tax_free_limit = compute_tax_free_limit_per_person(cfg)
     allocations = generate_allocations(cfg)
 
     best_total_net = float("-inf")
+    best_total_tax = 0.0
     best_allocation = None
     best_per_person_info = None
 
     for alloc in allocations:
         per_person_info = []
         total_net = 0.0
+        total_tax = 0.0
 
         for amount in alloc:
-            net, strat, eff_rate = best_strategy_for_person_amount(
+            net, strat, eff_rate, taxable, tax = best_strategy_for_person_amount(
                 amount, strategies, banks, cfg, tax_free_limit
             )
-            per_person_info.append((amount, net, strat, eff_rate))
+            per_person_info.append((amount, net, strat, eff_rate, taxable, tax))
             total_net += net
+            total_tax += tax
 
         if total_net > best_total_net:
             best_total_net = total_net
+            best_total_tax = total_tax
             best_allocation = alloc.copy()
             best_per_person_info = per_person_info
 
     print("=== ЛУЧШАЯ КОНФИГУРАЦИЯ ===")
     print(f"Всего денег: {cfg.total_amount:,.0f} ₽")
     print(f"Людей: {cfg.people_count}, шаг по сумме: {cfg.step:,.0f} ₽")
-    print(f"Базовая ключевая ставка: {cfg.key_rate_base*100:.2f}%, безналоговый доход на человека: {tax_free_limit:,.0f} ₽")
+    tax_free_limit = compute_tax_free_limit_per_person(cfg)
+    print(f"Базовая ключевая ставка: {cfg.key_rate_base*100:.2f}%, "
+          f"безналоговый доход на человека: {tax_free_limit:,.0f} ₽")
     print(f"Ставка НДФЛ: {cfg.tax_rate*100:.1f}%")
     print("Сценарии ключевой ставки:")
     for scen in cfg.key_rate_scenarios:
@@ -247,13 +380,15 @@ def search_best_config(cfg: Config, banks: Dict[str, Bank], strategies: List[Str
     print(f"Максимальный суммарный ОЖИДАЕМЫЙ ЧИСТЫЙ доход: {best_total_net:,.2f} ₽")
     if cfg.people_count > 0:
         print(f"В среднем в месяц (если горизонт ~1 год): {best_total_net/12:,.2f} ₽")
-    print("Распределение по людям и выбранные стратегии:")
+    print(f"Суммарный НДФЛ (ожидаемо): {best_total_tax:,.2f} ₽")
+    print("\nРаспределение по людям и выбранные стратегии:")
+
     if best_allocation is None or best_per_person_info is None:
         print("Что-то пошло не так, конфигурация не найдена.")
         return
 
     for i, info in enumerate(best_per_person_info, start=1):
-        amount, net, strat, eff_rate = info
+        amount, net, strat, eff_rate, taxable, tax = info
         if strat is None:
             strat_name = "нет вклада"
             bank_name = "-"
@@ -263,12 +398,15 @@ def search_best_config(cfg: Config, banks: Dict[str, Bank], strategies: List[Str
         print(
             f"Человек {i}: сумма={amount:,.0f} ₽, банк={bank_name}, "
             f"стратегия={strat_name}, эф.ставка={eff_rate*100:.3f}%, "
-            f"чистые проценты={net:,.2f} ₽"
+            f"чистые прибыль={net:,.2f} ₽, НДФЛ={tax:,.2f} ₽"
         )
     print()
 
 
+# ---------- Настройка банков и сценариев ----------
+
 def build_default_banks() -> Dict[str, Bank]:
+    # Тинькофф (примерная сетка)
     tinkoff = Bank(
         name="Tinkoff",
         terms={
@@ -287,6 +425,7 @@ def build_default_banks() -> Dict[str, Bank]:
         },
     )
 
+    # Alfa Only
     alfa = Bank(
         name="AlfaOnly",
         terms={
@@ -300,15 +439,16 @@ def build_default_banks() -> Dict[str, Bank]:
         },
     )
 
+    # Газпромбанк, вклад с ключевой + спред (таблица из скрина, при key_rate_base=16%)
     gazprom = Bank(
         name="Gazprom",
         terms={
-            "181d":  (181/365, 0.16 - 0.007),
-            "213d":  (213/365, 0.16 - 0.006),
-            "367d":  (367/365, 0.16 + 0.0),
-            "548d":  (548/365, 0.16 + 0.003),
-            "731d":  (731/365, 0.16 + 0.01),
-            "1095d": (1095/365, 0.16 + 0.02),
+            "181d":  (181/365, 0.16 - 0.007),  # -0.7 п.п. к ключевой
+            "213d":  (213/365, 0.16 - 0.006),  # -0.6
+            "367d":  (367/365, 0.16 + 0.000),  # 0
+            "548d":  (548/365, 0.16 + 0.003),  # +0.3
+            "731d":  (731/365, 0.16 + 0.010),  # +1.0
+            "1095d": (1095/365, 0.16 + 0.020), # +2.0
         },
     )
 
@@ -317,9 +457,9 @@ def build_default_banks() -> Dict[str, Bank]:
 
 def build_default_config() -> Config:
     scenarios = (
-        KeyRateScenario(prob=0.60, new_key_rate=0.15),
-        KeyRateScenario(prob=0.05, new_key_rate=0.14),
-        KeyRateScenario(prob=0.30, new_key_rate=0.17),
+        KeyRateScenario(prob=0.14, new_key_rate=0.15),
+        KeyRateScenario(prob=0.80, new_key_rate=0.13),
+        KeyRateScenario(prob=0.01, new_key_rate=0.17),
         KeyRateScenario(prob=0.05, new_key_rate=0.165),
     )
 
@@ -337,8 +477,8 @@ def build_default_config() -> Config:
         key_rate_scenarios=scenarios,
         bank_sensitivity=bank_sens,
         step=500_000.0,
-        min_years=0.95,
-        max_years=1.05,
+        min_years=0.90,
+        max_years=1.2,
         max_terms_per_strategy=12,
     )
     return cfg
@@ -350,9 +490,13 @@ def main():
 
     print("=== Автогенерация стратегий ===")
     strategies = auto_generate_all_strategies(banks, cfg)
-    print(f"Сгенерировано стратегий: {len(strategies)}")
+    print(f"Сгенерировано стратегий: {len(strategies)}\n")
 
+    # ТОП-5 стратегий (общий и по банкам)
+    print_top_strategies(strategies, banks, cfg, top_n=5)
     print()
+
+    # Поиск лучшей конфигурации по людям
     search_best_config(cfg, banks, strategies)
 
 
